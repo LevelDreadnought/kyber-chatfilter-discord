@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteTargetsManager">
+    <targets>
+      <target name="root@178.156.206.115:22" type="ssh/sftp" uuid="1a6d26bc-6ddb-4fe1-a36c-902e5ec26166">
+        <config>
+          <option name="projectRootOnTarget" value="/root/kyber-chatfilter-discord" />
+          <option name="serverName" value="root@178.156.206.115:22 password" />
+        </config>
+        <ContributedStateBase type="GoLanguageRuntime">
+          <config />
+        </ContributedStateBase>
+      </target>
+    </targets>
+  </component>
+</project>
