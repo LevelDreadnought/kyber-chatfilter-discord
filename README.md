@@ -4,7 +4,17 @@ A lightweight Go-based Docker image (sidecar) that monitors Kyber server logs an
 
 Designed to run alongside a Kyber dedicated server container without modifying either the Kyber image or ChatFilter plugin.
 
+## Index
 
+- [Overview](#overview)
+- [Quick Start](#quick-start-docker-run-example)
+- [Environment Variables](#environment-variables)
+- [Event Types](#event-types)
+- [Rate Limiting](#rate-limiting)
+- [Log Rotation](#log-rotation-handling)
+- [Docker Run Examples](#example-docker-configurations)
+- [Security & Performance](#security-notes)
+- [Volume Mount Setup](#recommended-docker-volume-mounts)
 
 ## Overview
 
@@ -63,12 +73,20 @@ docker run -d \
   -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxxx" \
   -e LOG_DIR=/mnt/logs \
   -e KYBER_SERVER_NAME="HvV Chaos #1" \
-  -v /path/to/kyber/logs:/mnt/logs:ro \
-  kyber-chatfilter-discord:latest
+  -v log_volume:/mnt/logs:ro \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
 ```
 
-That’s it.
+The docker image can be found at:
+`ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest`
 
+>⚠ **Important**: In order for the relay container to access the Kyber server logs, the Kyber server container 
+> **must** be created with a volume mount for its log directory. Docker does not allow mounting new volumes to an 
+> already existing container.  
+> Example:
+> ```bash
+> -v log_volume:/root/.local/share/maxima/wine/prefix/drive_c/users/root/AppData/Roaming/ArmchairDevelopers/Kyber/Logs \
+> ```
 
 
 # Environment Variables
@@ -125,6 +143,8 @@ The relay automatically classifies ChatFilter log lines:
 | `Error:`      | error      | ChatFilter Error     | 15158332 (Red)      |
 | *(no prefix)* | info       | ChatFilter Info      | 3447003 (Azure)     |
 
+Any `[ChatFilter]` log entry that does not start with Detection:, Action:, or Error: is treated as an info event.
+
 Example ChatFilter log lines:
 
 ```
@@ -159,7 +179,8 @@ The image contains two layers of protection:
 
 ### Internal Rate Limiting
 
-Each event type has its own timer.
+Each event type has its own timer. Rate limiting is applied per event type 
+(detection, action, error, info), not per message content.
 
 Default:
 
@@ -211,8 +232,8 @@ docker run -d \
   -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxxx" \
   -e LOG_DIR=/mnt/logs \
   -e KYBER_SERVER_NAME="My Kyber Server" \
-  -v /srv/kyber/logs:/mnt/logs:ro \
-  kyber-chatfilter-discord:latest
+  -v log_volume:/mnt/logs:ro \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
 ```
 
 All events go to one Discord channel.
@@ -223,15 +244,15 @@ All events go to one Discord channel.
 
 ```bash
 docker run -d \
-  --chatfilter-relay \
+  --name chatfilter-relay \
   -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/default" \
   -e DISCORD_WEBHOOK_DETECTION_URL="https://discord.com/api/webhooks/detection" \
   -e DISCORD_WEBHOOK_ACTION_URL="https://discord.com/api/webhooks/action" \
   -e DISCORD_WEBHOOK_ERROR_URL="https://discord.com/api/webhooks/error" \
   -e LOG_DIR=/mnt/logs \
   -e KYBER_SERVER_NAME="My Kyber Server" \
-  -v /srv/kyber/logs:/mnt/logs:ro \
-  kyber-chatfilter-discord:latest
+  -v log_volume:/mnt/logs:ro \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
 ```
 
 Detection logs → #detections  
@@ -248,7 +269,7 @@ Misc → #info-log
 
 ```bash
 docker run -d \
-  --chatfilter-relay \
+  --name chatfilter-relay \
   -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/default" \
   -e LOG_DIR=/mnt/logs \
   -e RATE_LIMIT_SECONDS=10 \
@@ -256,8 +277,8 @@ docker run -d \
   -e ENABLE_DETECTION=true \
   -e ENABLE_ACTION=true \
   -e KYBER_SERVER_NAME="My Kyber Server" \
-  -v /srv/kyber/logs:/mnt/logs:ro \
-  kyber-chatfilter-discord:latest
+  -v log_volume:/mnt/logs:ro \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
 ```
 
 * Info logs disabled
@@ -298,15 +319,24 @@ Always protect your webhook URLs.
 
 
 
-## Recommended Docker Volume Mount
+## Recommended Docker Volume Mounts
+
+### ChatFilter Relay Container
 
 Use read-only mount:
 
 ```bash
--v /path/to/kyber/logs:/mnt/logs:ro
+-v log_volume:/mnt/logs:ro
 ```
 
 Prevents accidental modification.
+
+### Kyber Dedicated Server Container
+
+```bash
+-v log_volume:/root/.local/share/maxima/wine/prefix/drive_c/users/root/AppData/Roaming/ArmchairDevelopers/Kyber/Logs \
+```
+Must be added on server container creation.
 
 
 ## Not Included
