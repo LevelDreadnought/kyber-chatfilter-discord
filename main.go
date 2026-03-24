@@ -1,3 +1,6 @@
+// ChatFilter plugin Discord relay for use alongside Kyber dedicated servers
+// Credit: LevelDreadnought
+
 package main
 
 import (
@@ -6,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,6 +44,33 @@ var (
 	infoWebhook      = os.Getenv("DISCORD_WEBHOOK_INFO_URL")
 )
 
+// persistence env vars
+var (
+	enablePersistence = getEnvBool("ENABLE_PERSISTENCE", false)
+	stateFilePath     = getEnv("STATE_FILE_PATH", "/mnt/state/state.json")
+	chatFilterURL     = getEnv("CHATFILTER_URL", "http://127.0.0.1:8081")
+	chatFilterToken   = getEnv("CHATFILTER_TOKEN", "CHANGE_ME_SECRET")
+	syncIntervalSec   = getEnvInt("SYNC_INTERVAL_SECONDS", 30)
+)
+
+// Ban and mute state structures in JSON
+type Ban struct {
+	Name    string `json:"name"`
+	Time    int64  `json:"time"`
+	Expires *int64 `json:"expires,omitempty"`
+	Reason  string `json:"reason"`
+	Manual  bool   `json:"manual"`
+}
+
+type Mute struct {
+	Expires *int64 `json:"expires,omitempty"`
+}
+
+type State struct {
+	Bans  map[int]Ban  `json:"bans"`
+	Mutes map[int]Mute `json:"mutes"`
+}
+
 // http client
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
@@ -54,6 +85,46 @@ func main() {
 	fmt.Println("ChatFilter Discord Sidecar Started")
 	fmt.Println("Polling interval:", pollIntervalMS, "ms")
 
+	// persistence logic
+	if enablePersistence {
+		if chatFilterToken == "" {
+			log.Println("CHATFILTER_TOKEN required when persistence enabled")
+		}
+
+		// restore state immediately on server startup with retry
+		for i := 0; i < 3; i++ {
+			err := restoreStateToChatFilter()
+			if err == nil {
+				log.Println("State restored to ChatFilter")
+				break
+			}
+
+			log.Println("Restore attempt failed:", err)
+			time.Sleep(2 * time.Second)
+		}
+
+		// periodically snapshot state (ban and mute lists)
+		go func() {
+			ticker := time.NewTicker(time.Duration(syncIntervalSec) * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				data, err := fetchStateFromChatFilter()
+				if err != nil {
+					log.Println("Snapshot fetch failed:", err)
+					continue
+				}
+
+				if err := writeStateToDisk(data); err != nil {
+					log.Println("Snapshot write failed:", err)
+				} else {
+					log.Println("State snapshot saved")
+				}
+			}
+		}()
+	}
+
+	// server log file tailer
 	for {
 		latest, err := getLatestLogFile(logDir)
 		if err != nil {
@@ -81,7 +152,7 @@ func getLatestLogFile(dir string) (string, error) {
 	return files[len(files)-1], nil
 }
 
-// opens most recent file and polls it for changes
+// opens most recent log file and polls it for changes
 func tailFile(path string) {
 	fmt.Println("Tailing:", path)
 
@@ -127,7 +198,27 @@ func processLine(line string) {
 
 	content := match[1]
 
-	cleanMessage, title, color, eventType := classifyEvent(content) //_ = eventType
+	// detect ChatFilter plugin restart and resync
+	if enablePersistence && strings.Contains(content, "Initialized plugin") {
+		log.Println("ChatFilter restart detected, resyncing state...")
+		go func() {
+			time.Sleep(3 * time.Second)
+
+			for i := 0; i < 3; i++ {
+				err := restoreStateToChatFilter()
+				if err == nil {
+					log.Println("State resynced after restart")
+					break
+				}
+
+				// retry sync after two seconds
+				log.Println("Resync attempt failed:", err)
+				time.Sleep(2 * time.Second)
+			}
+		}()
+	}
+
+	cleanMessage, title, color, eventType := classifyEvent(content)
 
 	// checks if each message type is enabled, return if disabled
 	if (eventType == "detection" && !enableDetection) ||
@@ -145,7 +236,7 @@ func processLine(line string) {
 		}
 	}
 
-	// sends embed to discord webhook
+	// sends embed to discord via webhook
 	webhook := getWebhookForEvent(eventType)
 	err := sendToDiscord(webhook, title, cleanMessage, color)
 	if err == nil {
@@ -154,6 +245,7 @@ func processLine(line string) {
 
 }
 
+// returns ChatFilter event with settings based on event type prefix
 func classifyEvent(content string) (clean, title string, color int, eventType string) {
 	switch {
 	case strings.HasPrefix(content, "Detection:"):
@@ -182,7 +274,7 @@ func classifyEvent(content string) (clean, title string, color int, eventType st
 	}
 }
 
-// resolves webhook env vars
+// resolves webhook environment variables
 func getWebhookForEvent(eventType string) string {
 	switch eventType {
 	case "detection":
@@ -205,6 +297,7 @@ func getWebhookForEvent(eventType string) string {
 	return defaultWebhook
 }
 
+// formats ChatFilter event and sends it to discord
 func sendToDiscord(webhook, title, message string, color int) error {
 	payload := map[string]interface{}{
 		"allowed_mentions": map[string]interface{}{
@@ -223,6 +316,7 @@ func sendToDiscord(webhook, title, message string, color int) error {
 		},
 	}
 
+	// marshal JSON for discord embed
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -260,6 +354,86 @@ func sendToDiscord(webhook, title, message string, color int) error {
 	return nil
 }
 
+// retrieves ban and mute list from the ChatFilter plugin
+func fetchStateFromChatFilter() ([]byte, error) {
+	resp, err := httpClient.Get(chatFilterURL + "/state")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /state failed: %s", resp.Status)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// safely writes state data to disk (volume shared with host if using docker)
+func writeStateToDisk(data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(stateFilePath), 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(stateFilePath, data, 0644)
+}
+
+// restores ban and mute lists from disk to the ChatFilter plugin
+func restoreStateToChatFilter() error {
+	data, err := os.ReadFile(stateFilePath)
+	if os.IsNotExist(err) {
+		return nil // first boot, nothing to restore
+	}
+	if err != nil {
+		return err
+	}
+
+	// inject bans and mutes JSON into payload
+	var stateData map[string]interface{}
+	if err := json.Unmarshal(data, &stateData); err != nil {
+		return err
+	}
+
+	// ensure structure is valid
+	if stateData["bans"] == nil {
+		stateData["bans"] = map[string]interface{}{}
+	}
+	if stateData["mutes"] == nil {
+		stateData["mutes"] = map[string]interface{}{}
+	}
+
+	payload := map[string]interface{}{
+		"token": chatFilterToken,
+		"bans":  stateData["bans"],
+		"mutes": stateData["mutes"],
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", chatFilterURL+"/sync", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("sync failed: %s", resp.Status)
+	}
+
+	return nil
+}
+
+// environment variable getter functions
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

@@ -9,6 +9,7 @@ Designed to run alongside a Kyber dedicated server container without modifying e
 - [Overview](#overview)
 - [Quick Start](#quick-start-docker-run-example)
 - [Environment Variables](#environment-variables)
+- [Persistence](#persistence)
 - [Event Types](#event-types)
 - [Rate Limiting](#rate-limiting)
 - [Log Rotation](#log-rotation-handling)
@@ -28,6 +29,9 @@ This relay:
 * Supports per-event rate limiting
 * Automatically handles Discord 429 rate limits
 * Detects log rotation automatically
+* Allows persistence of ChatFilter moderation state (ban and mute lists) across restarts
+* Syncs state with the ChatFilter plugin via HTTP
+* Automatically restores state to ChatFilter after server restarts
 
 This relay is **optional** and not required for the ChatFilter plugin to function.
 
@@ -42,10 +46,21 @@ Writes to kyber-server_*.log
 Discord Relay (this container)
         ↓
 Discord Webhook
+
+------------------------------
+
+Persistence (optional)
+
+ChatFilter HTTP API
+    ↑        ↓
+/state     /sync
+    ↓        ↑
+Local JSON state file
+
 ```
 
 The container's interaction with server logs is read-only.
-It does not modify any data in the Kyber container in any way.
+It does not modify any data in the Kyber container directly.
 
 
 ## Requirements
@@ -62,6 +77,7 @@ It does not modify any data in the Kyber container in any way.
 * Custom server name
 * Rate limiting controls
 * Event type toggles
+* Persistence (ban/mute list syncing)
 
 
 
@@ -94,7 +110,7 @@ The docker image can be found at:
 ## Required
 
 | Variable              | Description                    |
-| --------------------- | ------------------------------ |
+|-----------------------|--------------------------------|
 | `DISCORD_WEBHOOK_URL` | Default webhook for all events |
 
 If this is not set, the container will exit.
@@ -106,7 +122,7 @@ If this is not set, the container will exit.
 You can route different event types to different Discord channels:
 
 | Variable                        | Event Type         |
-| ------------------------------- | ------------------ |
+|---------------------------------|--------------------|
 | `DISCORD_WEBHOOK_DETECTION_URL` | Word detections    |
 | `DISCORD_WEBHOOK_ACTION_URL`    | Mutes, kicks, bans |
 | `DISCORD_WEBHOOK_ERROR_URL`     | Errors             |
@@ -119,7 +135,7 @@ If not set, events for variables not set fall back to `DISCORD_WEBHOOK_URL`.
 ## Optional Configuration Variables
 
 | Variable             | Default        | Description                             |
-| -------------------- | -------------- | --------------------------------------- |
+|----------------------|----------------|-----------------------------------------|
 | `LOG_DIR`            | `/mnt/logs`    | Directory containing Kyber logs         |
 | `KYBER_SERVER_NAME`  | `Kyber Server` | Display name in Discord embed           |
 | `RATE_LIMIT_SECONDS` | `5`            | Minimum seconds between same event type |
@@ -130,6 +146,70 @@ If not set, events for variables not set fall back to `DISCORD_WEBHOOK_URL`.
 | `ENABLE_ERROR`       | `true`         | Send error events                       |
 | `ENABLE_INFO`        | `true`         | Send info events                        |
 
+
+## Persistence
+
+The relay optionally supports **state persistence for bans and mutes** using the ChatFilter plugin’s HTTP API.
+
+### Features
+
+* Periodically fetches state (ban/mute list) from ChatFilter (`/state`)
+* Saves state to disk as JSON
+* Restores state back to ChatFilter (`/sync`) on Kyber server restart
+
+### Persistence Environment Variables
+
+| Variable                | Default                 | Description                 |
+|-------------------------|-------------------------|-----------------------------|
+| `ENABLE_PERSISTENCE`    | `false`                 | Enable persistence system   |
+| `STATE_FILE_PATH`       | `/mnt/state/state.json` | Path to stored state file   |
+| `CHATFILTER_URL`        | `http://127.0.0.1:8081` | ChatFilter HTTP API URL     |
+| `CHATFILTER_TOKEN`      | `CHANGE_ME_SECRET`      | HTTP auth token for `/sync` |
+| `SYNC_INTERVAL_SECONDS` | `30`                    | Snapshot interval           |
+
+
+### How It Works
+
+#### Snapshot Loop
+
+Every `SYNC_INTERVAL_SECONDS`:
+
+```
+GET /state → save to disk as state.json
+```
+
+#### Restore on Relay Startup
+
+On relay container start:
+
+```
+Read state.json → POST /sync
+```
+
+#### 3. Automatic Resync on ChatFilter Restart
+
+When this server log entry appears after a Kyber server restart:
+
+```
+[ChatFilter] Initialized plugin
+```
+
+The relay:
+
+* Waits briefly for the ChatFilter plugin to fully initialize
+* Restores ban/mute lists to ChatFilter automatically
+* Retries sync up to 3 times if HTTP times out
+
+
+### Volume Setup for Persistence
+
+>⚠ **Important**: In order for the persistence feature to work properly and for state.json to survive relay
+> container restarts/redeployments, the relay container **must** be created with a volume mount for its state
+> directory. Docker does not allow mounting new volumes to an already existing container.  
+> Example:
+>```bash
+>-v /home/username:/mnt/state
+>```
 
 
 ## Event Types
@@ -265,7 +345,7 @@ Misc → #info-log
 
 
 
-### Example 3: High-Traffic Server Tuning
+### Example 3: High-Traffic Server
 
 ```bash
 docker run -d \
@@ -288,15 +368,57 @@ docker run -d \
 * Can still use multiple webhooks if needed
 
 
+### Example 4: Simple Setup with Persistence Enabled
+
+```bash
+docker run -d \
+  --name chatfilter-relay \
+  -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxxx" \
+  -e LOG_DIR=/mnt/logs \
+  -e KYBER_SERVER_NAME="My Kyber Server" \
+  -e ENABLE_PERSISTENCE=true \
+  -e CHATFILTER_TOKEN="MY_AUTH_TOKEN"
+  -v log_volume:/mnt/logs:ro \
+  -v /home/username:/mnt/state \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
+```
+
+Enables ban/mute list persistence and sets the ChatFilter HTTP API auth token
+
+
+### Example 5: Setup with Additional Persistence Options Set
+
+```bash
+docker run -d \
+  --name chatfilter-relay \
+  -e DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxxx" \
+  -e LOG_DIR=/mnt/logs \
+  -e KYBER_SERVER_NAME="My Kyber Server" \
+  -e ENABLE_PERSISTENCE=true \
+  -e CHATFILTER_TOKEN="MY_AUTH_TOKEN" \
+  -e CHATFILTER_URL="http://192.168.0.1:8085" \
+  -e SYNC_INTERVAL_SECONDS=15 \
+  -v log_volume:/mnt/logs:ro \
+  -v /home/username:/mnt/state \
+  ghcr.io/leveldreadnought/kyber-chatfilter-discord:latest
+```
+
+* Enables ban/mute list persistence
+* Sets the ChatFilter HTTP API auth token
+* Changes the url and port of the ChatFilter plugin
+* Decreases the state sync time
+
 
 ## Security Notes
 
-* The container only reads logs (read-only mount recommended)
-* No inbound ports are exposed
-* No external API used other than Discord webhook
+* The relay container only reads logs (read-only mount recommended)
 * Does not modify Kyber server container files
+* Recommend a **trusted internal network** when persistence is enabled
+* No external API used other than Discord webhook and ChatFilter's API
+* Strongly recommend changing the default `CHATFILTER_TOKEN` value
+* Avoid exposing the ChatFilter HTTP API publicly
 
-Always protect your webhook URLs.
+Always protect your Discord webhook URLs.
 
 
 
@@ -306,6 +428,7 @@ Always protect your webhook URLs.
 * Lightweight memory usage
 * Handles large log files
 * Minimal CPU overhead
+* No external dependencies
 * Designed for high-chat-traffic Kyber servers
 
 
@@ -331,6 +454,14 @@ Use read-only mount:
 
 Prevents accidental modification.
 
+#### Persistence
+
+```bash
+  -v /home/username:/mnt/state
+```
+
+Sets location of `state.json` on the host
+
 ### Kyber Dedicated Server Container
 
 ```bash
@@ -344,11 +475,9 @@ Must be added on server container creation.
 This relay:
 
 * Does NOT modify Kyber server behavior
-* Does NOT persist ChatFilter bans
 * Does NOT read player state
-* Does NOT require Kyber plugin HTTP support
 
-It is strictly a log-forwarding service.
+It is strictly a log-forwarding and persistence service.
 
 
 ## Compatible With
@@ -356,7 +485,7 @@ It is strictly a log-forwarding service.
 * Kyber dedicated servers
 * ChatFilter plugin
 * Docker-based deployments
-* Sidecar architecture
+* Docker Sidecar architecture
 
 
 

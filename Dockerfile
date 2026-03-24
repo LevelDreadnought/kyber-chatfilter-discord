@@ -3,17 +3,17 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Enable static binary build
+# enable static binary build
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 
-# Copy source
+# copy source
 COPY main.go .
 
-# Initialize module (if not using go.mod)
+# initialize module
 RUN go mod init chatfilter-discord && \
     go mod tidy
 
-# Build binary
+# build binary
 RUN go build -ldflags="-s -w" -o chatfilter-discord
 
 # ---------- Runtime Stage ----------
@@ -21,17 +21,21 @@ FROM alpine:3.19
 
 WORKDIR /app
 
-# Install CA certificates (required for HTTPS to Discord)
+# install CA certificates (required for HTTPS calls to Discord)
 RUN apk add --no-cache ca-certificates
 
-# Copy compiled binary
+# copy compiled binary
 COPY --from=builder /app/chatfilter-discord /app/chatfilter-discord
 
-# Create logs mount point
-RUN mkdir -p /mnt/logs
+# create log and state mount points
+RUN mkdir -p /mnt/logs /mnt/state
 
-# Run as non-root (recommended)
+# create non-root user
 RUN adduser -D appuser
+
+# fix permissions
+RUN chown -R appuser:appuser /mnt
+
 USER appuser
 
 ENTRYPOINT ["/app/chatfilter-discord"]
